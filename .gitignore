@@ -1,0 +1,12 @@
+# Local AWS config & credentials (never commit secrets)
+.aws_cp_config.json
+*.credentials
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.spec
+.pytest_cache/
