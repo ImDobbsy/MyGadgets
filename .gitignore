@@ -1,5 +1,6 @@
-# Local AWS config & credentials (never commit secrets)
+# Local AWS & SQL config & credentials (never commit secrets)
 .aws_cp_config.json
+.sql_backup_config.json
 *.credentials
 
 # Python cache & build artifacts
