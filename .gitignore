@@ -1,6 +1,8 @@
 # Local AWS & SQL config & credentials (never commit secrets)
 .aws_cp_config.json
 .sql_backup_config.json
+.sql_restore_config.json
+_RestoreStaging/
 *.credentials
 
 # Python cache & build artifacts
