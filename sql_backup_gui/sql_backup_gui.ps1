@@ -193,7 +193,7 @@ function ConvertTo-TsqlString {
 
 function Get-CreateSubdirTsql {
     param([string]$SubfolderPath)
-    return "EXEC master.dbo.xp_create_subdir $(ConvertTo-TsqlString -Value $SubfolderPath);"
+    return "BEGIN TRY EXEC master.dbo.xp_create_subdir $(ConvertTo-TsqlString -Value $SubfolderPath); END TRY BEGIN CATCH END CATCH;"
 }
 
 function Get-BackupDatabaseTsql {
@@ -432,7 +432,7 @@ $lblTarget.Location = New-Object System.Drawing.Point(12, 24)
 $lblTarget.AutoSize = $true
 $grpSettings.Controls.Add($lblTarget)
 
-$defaultTargetDir = Join-Path $env:USERPROFILE "SqlBackups"
+$defaultTargetDir = "C:\SqlBackups"
 $txtTarget = New-Object System.Windows.Forms.TextBox
 $txtTarget.Text = $defaultTargetDir
 $txtTarget.Location = New-Object System.Drawing.Point(180, 21)
@@ -1035,6 +1035,13 @@ $workerScriptBlock = {
         if (-not (Test-Path -LiteralPath $Subfolder)) {
             New-Item -ItemType Directory -Force -Path $Subfolder -ErrorAction SilentlyContinue | Out-Null
         }
+        if (Test-Path -LiteralPath $Subfolder) {
+            $parentDir = Split-Path -Parent $Subfolder
+            if ($parentDir -and (Test-Path -LiteralPath $parentDir)) {
+                & icacls $parentDir /grant "*S-1-5-32-545:(OI)(CI)M" /grant "*S-1-5-11:(OI)(CI)M" /Q 2>$null | Out-Null
+            }
+            & icacls $Subfolder /grant "*S-1-5-32-545:(OI)(CI)M" /grant "*S-1-5-11:(OI)(CI)M" /Q 2>$null | Out-Null
+        }
     }
     catch {}
 
@@ -1061,10 +1068,17 @@ $workerScriptBlock = {
     try {
         $conn.Open()
 
-        $dirCmd = $conn.CreateCommand()
-        $dirCmd.CommandTimeout = 60
-        $dirCmd.CommandText = $CreateDirSql
-        [void]$dirCmd.ExecuteNonQuery()
+        if (-not (Test-Path -LiteralPath $Subfolder)) {
+            try {
+                $dirCmd = $conn.CreateCommand()
+                $dirCmd.CommandTimeout = 60
+                $dirCmd.CommandText = $CreateDirSql
+                [void]$dirCmd.ExecuteNonQuery()
+            }
+            catch {
+                # Ignore xp_create_subdir Error 183 ('Cannot create a file when that file already exists')
+            }
+        }
 
         try {
             $bakCmd = $conn.CreateCommand()
@@ -1073,7 +1087,7 @@ $workerScriptBlock = {
             [void]$bakCmd.ExecuteNonQuery()
         }
         catch {
-            $exMsg = $_.Exception.Message
+            $exMsg = $_.Exception.GetBaseException().Message
             if ($AllowFallback -and ($exMsg -match 'COMPRESSION is not supported' -or $exMsg -match '1844')) {
                 $EventQueue.Enqueue(@{
                     Type = "LOG"
@@ -1181,7 +1195,7 @@ $workerScriptBlock = {
             Success = $false
             Elapsed = $sw.Elapsed.TotalSeconds
             StreamCount = $StreamCount
-            Error = $_.Exception.Message
+            Error = ($_.Exception.GetBaseException().Message -replace "(\r|\n)+", " ")
         })
     }
     finally {

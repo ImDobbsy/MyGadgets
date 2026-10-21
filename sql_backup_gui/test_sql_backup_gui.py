@@ -93,6 +93,17 @@ class TestSqlBackupGui(unittest.TestCase):
             for p in bak_paths:
                 self.assertFalse(os.path.exists(p))
 
+    def test_create_subdir_tsql_wraps_error_183_in_try_catch(self):
+        sql = sql_backup_gui.build_create_subdir_tsql(r"C:\Users\cdobbs4\SqlBackups\TSTSystemCatalog")
+        self.assertIn("BEGIN TRY", sql)
+        self.assertIn("EXEC master.dbo.xp_create_subdir N'C:\\Users\\cdobbs4\\SqlBackups\\TSTSystemCatalog'", sql)
+        self.assertIn("END CATCH;", sql)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sub = os.path.join(tmpdir, "TSTSystemCatalog")
+            sql_backup_gui.ensure_local_backup_dir_permissions(tmpdir, sub)
+            self.assertTrue(os.path.isdir(sub))
+
     def test_build_backup_tsql_copy_only_and_stripes(self):
         _, paths = sql_backup_gui.build_backup_file_paths(
             target_folder=r"E:\Backups",

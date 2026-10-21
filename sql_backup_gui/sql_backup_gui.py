@@ -362,8 +362,50 @@ def escape_tsql_string(value: str) -> str:
 
 
 def build_create_subdir_tsql(subfolder_path: str) -> str:
-    """Build T-SQL statement to create the target subfolder on the SQL Server host."""
-    return f"EXEC master.dbo.xp_create_subdir {escape_tsql_string(subfolder_path)};"
+    """
+    Build T-SQL statement to create the target subfolder on the SQL Server host.
+    Wrapped in TRY/CATCH so Win32 Error 183 ('Cannot create a file when that file already exists')
+    never aborts the backup when the folder or a restricted parent folder already exists.
+    """
+    return (
+        f"BEGIN TRY EXEC master.dbo.xp_create_subdir {escape_tsql_string(subfolder_path)}; "
+        f"END TRY BEGIN CATCH END CATCH;"
+    )
+
+
+def ensure_local_backup_dir_permissions(target_folder: str, db_subfolder: str) -> None:
+    """
+    Create the target backup folder and per-database subfolder locally (if reachable)
+    and grant Modify permissions to Builtin\\Users (*S-1-5-32-545) and Authenticated Users (*S-1-5-11)
+    so the SQL Server service account (e.g. NT SERVICE\\MSSQLSERVER) can write .bak files even
+    when the user picks a folder inside C:\\Users\\<username>\\SqlBackups.
+    """
+    try:
+        os.makedirs(db_subfolder, exist_ok=True)
+    except OSError:
+        return
+
+    if os.name == "nt" and os.path.isdir(db_subfolder):
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for folder in (target_folder, db_subfolder):
+            if folder and os.path.isdir(folder):
+                try:
+                    subprocess.run(
+                        [
+                            "icacls",
+                            folder,
+                            "/grant",
+                            "*S-1-5-32-545:(OI)(CI)M",
+                            "/grant",
+                            "*S-1-5-11:(OI)(CI)M",
+                            "/Q",
+                        ],
+                        capture_output=True,
+                        creationflags=creationflags,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
 
 
 def build_backup_tsql(
@@ -612,11 +654,8 @@ finally {
                 error_message="Cancelled before start.",
             )
 
-        # Best-effort local subfolder creation
-        try:
-            os.makedirs(db_subfolder, exist_ok=True)
-        except OSError:
-            pass
+        # Ensure local subfolder exists and grants write access to the SQL Server service account
+        ensure_local_backup_dir_permissions(options.target_folder, db_subfolder)
 
         create_dir_tsql = build_create_subdir_tsql(db_subfolder)
         backup_tsql_compressed = build_backup_tsql(
@@ -649,6 +688,7 @@ $backupSql = $env:SQL_BG_BACKUP_SQL
 $backupFallbackSql = $env:SQL_BG_BACKUP_FALLBACK_SQL
 $verifySql = $env:SQL_BG_VERIFY_SQL
 $allowFallback = ($env:SQL_BG_ALLOW_COMPRESSION_FALLBACK -eq '1')
+$localSubfolder = $env:SQL_BG_LOCAL_SUBFOLDER
 
 $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
 $conn.FireInfoMessageEventOnUserErrors = $false
@@ -667,11 +707,18 @@ $conn.add_InfoMessage($msgHandler)
 try {
     $conn.Open()
 
-    # 1. Create per-database subfolder on SQL Server host
-    $dirCmd = $conn.CreateCommand()
-    $dirCmd.CommandTimeout = 60
-    $dirCmd.CommandText = $createDirSql
-    [void]$dirCmd.ExecuteNonQuery()
+    # 1. Create per-database subfolder on SQL Server host (ignore Error 183 if it already exists)
+    if ([string]::IsNullOrWhiteSpace($localSubfolder) -or (-not (Test-Path -LiteralPath $localSubfolder))) {
+        try {
+            $dirCmd = $conn.CreateCommand()
+            $dirCmd.CommandTimeout = 60
+            $dirCmd.CommandText = $createDirSql
+            [void]$dirCmd.ExecuteNonQuery()
+        }
+        catch {
+            # Ignore xp_create_subdir Error 183 ('Cannot create a file when that file already exists')
+        }
+    }
 
     # 2. Execute BACKUP DATABASE (with automatic compression fallback if unsupported by edition)
     $usedCompression = $allowFallback
@@ -682,7 +729,7 @@ try {
         [void]$bakCmd.ExecuteNonQuery()
     }
     catch {
-        $exMsg = $_.Exception.Message
+        $exMsg = $_.Exception.GetBaseException().Message
         if ($allowFallback -and ($exMsg -match 'COMPRESSION is not supported' -or $exMsg -match '1844')) {
             [Console]::Out.WriteLine("SQL_WARN: Compression not supported by SQL edition; retrying without COMPRESSION...")
             [Console]::Out.Flush()
@@ -710,6 +757,12 @@ try {
     [Console]::Out.WriteLine("SQL_DONE: USED_COMPRESSION=" + $usedCompression)
     [Console]::Out.Flush()
 }
+catch {
+    $cleanErr = $_.Exception.GetBaseException().Message -replace "(\r|\n)+", " "
+    [Console]::Out.WriteLine("SQL_ERROR: " + $cleanErr)
+    [Console]::Out.Flush()
+    exit 1
+}
 finally {
     if ($conn.State -ne 'Closed') { $conn.Close() }
     $conn.Dispose()
@@ -722,6 +775,7 @@ finally {
         env["SQL_BG_BACKUP_FALLBACK_SQL"] = backup_tsql_uncompressed
         env["SQL_BG_VERIFY_SQL"] = verify_tsql
         env["SQL_BG_ALLOW_COMPRESSION_FALLBACK"] = "1" if options.compression else "0"
+        env["SQL_BG_LOCAL_SUBFOLDER"] = db_subfolder
 
         if progress_callback:
             progress_callback(
@@ -751,6 +805,7 @@ finally {
 
         used_compression = options.compression
         output_lines: List[str] = []
+        sql_error_msg: str = ""
         pct_regex = re.compile(r"(\d+)\s+percent\s+processed", re.IGNORECASE)
 
         try:
@@ -791,6 +846,8 @@ finally {
                     warn_msg = line[len("SQL_WARN:") :].strip()
                     if progress_callback:
                         progress_callback(db_info.name, -1, warn_msg)
+                elif line.startswith("SQL_ERROR:"):
+                    sql_error_msg = line[len("SQL_ERROR:") :].strip()
                 elif line.startswith("SQL_DONE:"):
                     if "USED_COMPRESSION=False" in line:
                         used_compression = False
@@ -802,7 +859,11 @@ finally {
 
         if proc.returncode != 0:
             elapsed = time.time() - start_time
-            err_detail = "\n".join(output_lines[-6:]) if output_lines else f"Exit code {proc.returncode}"
+            err_detail = (
+                sql_error_msg
+                if sql_error_msg
+                else ("\n".join(output_lines[-6:]) if output_lines else f"Exit code {proc.returncode}")
+            )
             return BackupJobResult(
                 db_name=db_info.name,
                 success=False,
@@ -885,8 +946,8 @@ class SqlBackupApp:
         self.var_trust_cert = tk.BooleanVar(value=True)
         self.var_include_system = tk.BooleanVar(value=False)
 
-        default_target = str(Path.home() / "SqlBackups")
-        default_zip = str(Path.home() / "SqlBackups" / "Zipped")
+        default_target = r"C:\SqlBackups"
+        default_zip = r"C:\SqlBackups\Zipped"
         self.var_target_folder = tk.StringVar(value=default_target)
         self.var_zip_after_backup = tk.BooleanVar(value=True)
         self.var_zip_folder = tk.StringVar(value=default_zip)
