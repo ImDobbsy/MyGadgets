@@ -93,6 +93,12 @@ class TestAwsCpGui(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_powershell_script_variables_and_syntax(self):
+        ps1_path = Path(__file__).resolve().parent / "aws_cp_gui.ps1"
+        content = ps1_path.read_text(encoding="utf-8")
+        self.assertIn('${url}?${canonicalQuery}', content)
+        self.assertNotIn('"$url?$canonicalQuery"', content)
+
 
 if __name__ == "__main__":
     unittest.main()

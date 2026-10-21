@@ -217,10 +217,11 @@ function Invoke-S3SignedRequest {
         $authHeader = "AWS4-HMAC-SHA256 Credential=$($AccessKey.Trim())/$credScope, SignedHeaders=$signedHeaders, Signature=$signature"
 
         $url = "https://$hostName$canonicalUri"
-        if ($canonicalQuery) { $url = "$url?$canonicalQuery" }
+        if ($canonicalQuery) { $url = "${url}?${canonicalQuery}" }
 
         $req = [System.Net.HttpWebRequest]::Create($url)
         $req.Method = $Method.ToUpperInvariant()
+        $req.AllowAutoRedirect = $false
         $req.Host = $hostName
         $req.Headers.Add("x-amz-content-sha256", $PayloadHash)
         $req.Headers.Add("x-amz-date", $amzDate)
@@ -252,7 +253,22 @@ function Invoke-S3SignedRequest {
 
         try {
             $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+            $statusCode = [int]$resp.StatusCode
+            if ($statusCode -ge 300 -and $statusCode -lt 400) {
+                $discRegion = $resp.Headers["x-amz-bucket-region"]
+                $resp.Close()
+                if ($attempt -eq 0 -and $Bucket -and $discRegion -and ($discRegion -ne $effRegion)) {
+                    $Script:BucketRegionCache[$Bucket] = $discRegion
+                    $effRegion = $discRegion
+                    continue
+                }
+                throw "S3 Redirect ($statusCode). Bucket may reside in region '$discRegion'."
+            }
             try {
+                $respRegion = $resp.Headers["x-amz-bucket-region"]
+                if ($Bucket -and $respRegion) {
+                    $Script:BucketRegionCache[$Bucket] = $respRegion
+                }
                 if ($OutFile) {
                     $outDir = Split-Path -Parent $OutFile
                     if ($outDir -and (-not (Test-Path -LiteralPath $outDir))) {
@@ -774,16 +790,17 @@ $btnListBuckets.Add_Click({
             -Region $cmbRegion.Text
         [xml]$doc = $xmlText
         $cmbBucket.Items.Clear()
-        $buckets = @($doc.ListAllMyBucketsResult.Buckets.Bucket)
-        foreach ($b in $buckets) {
-            if ($null -ne $b -and $b.Name) {
-                [void]$cmbBucket.Items.Add($b.Name)
+        foreach ($nameNode in $doc.SelectNodes("//*[local-name()='Bucket']/*[local-name()='Name']")) {
+            if ($null -ne $nameNode -and $nameNode.InnerText) {
+                [void]$cmbBucket.Items.Add($nameNode.InnerText.Trim())
             }
         }
+        Write-UiLog "Listed $($cmbBucket.Items.Count) bucket(s)."
         if ($cmbBucket.Items.Count -gt 0 -and [string]::IsNullOrWhiteSpace($cmbBucket.Text)) {
             $cmbBucket.SelectedIndex = 0
+        } elseif (-not [string]::IsNullOrWhiteSpace($cmbBucket.Text)) {
+            Refresh-S3Objects
         }
-        Write-UiLog "Listed $($cmbBucket.Items.Count) bucket(s)."
     } catch {
         Write-UiLog "ListBuckets error: $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "S3 Error") | Out-Null
@@ -792,6 +809,16 @@ $btnListBuckets.Add_Click({
 
 function Refresh-S3Objects {
     $bucket = $cmbBucket.Text.Trim()
+    if ($bucket.StartsWith("s3://")) {
+        try {
+            $parsedUri = Split-S3Uri $bucket
+            $bucket = $parsedUri.Bucket
+            $cmbBucket.Text = $bucket
+            if ($parsedUri.Key -and [string]::IsNullOrWhiteSpace($txtPrefix.Text)) {
+                $txtPrefix.Text = $parsedUri.Key
+            }
+        } catch {}
+    }
     if (-not $bucket) {
         [System.Windows.Forms.MessageBox]::Show("Please enter or select an S3 bucket name.", "Bucket Required") | Out-Null
         return
@@ -814,12 +841,10 @@ function Refresh-S3Objects {
         [xml]$doc = $xmlText
         $lvS3.Items.Clear()
 
-        $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
-        $ns.AddNamespace("s3", $doc.DocumentElement.NamespaceURI)
-
-        foreach ($cp in $doc.SelectNodes("//s3:CommonPrefixes/s3:Prefix", $ns)) {
-            $pVal = $cp.InnerText
-            $rel = if ($pVal.StartsWith($prefix)) { $pVal.Substring($prefix.Length).TrimEnd('/') } else { $pVal }
+        foreach ($cp in $doc.SelectNodes("//*[local-name()='CommonPrefixes']/*[local-name()='Prefix']")) {
+            $pVal = [string]$cp.InnerText
+            if (-not $pVal) { continue }
+            $rel = if ($prefix -and $pVal.StartsWith($prefix)) { $pVal.Substring($prefix.Length).TrimEnd('/') } else { $pVal.TrimEnd('/') }
             $lvi = New-Object System.Windows.Forms.ListViewItem("[DIR] $rel/")
             $lvi.Tag = $pVal
             [void]$lvi.SubItems.Add("Folder")
@@ -827,24 +852,41 @@ function Refresh-S3Objects {
             [void]$lvi.SubItems.Add("")
             [void]$lvS3.Items.Add($lvi)
         }
-        foreach ($c in $doc.SelectNodes("//s3:Contents", $ns)) {
-            $kVal = $c.Key
-            if ($kVal -eq $prefix) { continue }
-            $rel = if ($kVal.StartsWith($prefix)) { $kVal.Substring($prefix.Length) } else { $kVal }
+        foreach ($c in $doc.SelectNodes("//*[local-name()='Contents']")) {
+            $kNode = $c.SelectSingleNode("*[local-name()='Key']")
+            if ($null -eq $kNode) { continue }
+            $kVal = [string]$kNode.InnerText
+            if (-not $kVal -or $kVal -eq $prefix) { continue }
+            $rel = if ($prefix -and $kVal.StartsWith($prefix)) { $kVal.Substring($prefix.Length) } else { $kVal }
+            $sizeNode = $c.SelectSingleNode("*[local-name()='Size']")
+            $sizeBytes = if ($null -ne $sizeNode -and $sizeNode.InnerText) { [long]$sizeNode.InnerText } else { 0L }
+            $modNode = $c.SelectSingleNode("*[local-name()='LastModified']")
+            $modRaw = if ($null -ne $modNode -and $modNode.InnerText) { [string]$modNode.InnerText } else { "" }
+            $modStr = if ($modRaw) { $modRaw.Substring(0, [Math]::Min(19, $modRaw.Length)).Replace("T", " ") } else { "" }
+
             $lvi = New-Object System.Windows.Forms.ListViewItem($rel)
             $lvi.Tag = $kVal
             [void]$lvi.SubItems.Add("Object")
-            [void]$lvi.SubItems.Add((Format-ByteSize ([long]$c.Size)))
-            [void]$lvi.SubItems.Add($c.LastModified.Substring(0, [Math]::Min(19, $c.LastModified.Length)).Replace("T", " "))
+            [void]$lvi.SubItems.Add((Format-ByteSize $sizeBytes))
+            [void]$lvi.SubItems.Add($modStr)
             [void]$lvS3.Items.Add($lvi)
         }
-        Write-UiLog "Loaded $($lvS3.Items.Count) item(s) in s3://$bucket/$prefix"
+        $uriDisplay = if ($prefix) { "s3://$bucket/$prefix" } else { "s3://$bucket/" }
+        if ($rbUpload.Checked -and [string]::IsNullOrWhiteSpace($txtTarget.Text)) {
+            $txtTarget.Text = $uriDisplay
+            Update-Preview
+        }
+        Write-UiLog "Loaded $($lvS3.Items.Count) item(s) in $uriDisplay"
     } catch {
         Write-UiLog "Error listing s3://$bucket/$prefix : $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "S3 Browse Error") | Out-Null
     }
 }
 
+$cmbBucket.Add_SelectedIndexChanged({
+    $txtPrefix.Text = ""
+    Refresh-S3Objects
+})
 $btnS3Browse.Add_Click({ Refresh-S3Objects })
 $btnS3Up.Add_Click({
     $p = $txtPrefix.Text.Trim().Trim('/')
@@ -1006,12 +1048,12 @@ $btnStart.Add_Click({
                         -Bucket $parsed.Bucket `
                         -QueryParams $q
                     [xml]$doc = $xmlText
-                    $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
-                    $ns.AddNamespace("s3", $doc.DocumentElement.NamespaceURI)
-                    $nodes = @($doc.SelectNodes("//s3:Contents", $ns))
+                    $nodes = @($doc.SelectNodes("//*[local-name()='Contents']"))
                     Write-UiLog "Downloading $($nodes.Count) object(s) from s3://$($parsed.Bucket)/$($parsed.Key) ..."
                     foreach ($c in $nodes) {
-                        $kVal = [string]$c.Key
+                        $kNode = $c.SelectSingleNode("*[local-name()='Key']")
+                        if ($null -eq $kNode) { continue }
+                        $kVal = [string]$kNode.InnerText
                         if (-not $kVal -or $kVal.EndsWith("/")) { continue }
                         $rel = if ($parsed.Key -and $kVal.StartsWith($parsed.Key)) {
                             $kVal.Substring($parsed.Key.Length).TrimStart('/')
@@ -1067,12 +1109,13 @@ $btnStart.Add_Click({
 if (Test-Path -LiteralPath $Script:LocalConfigFile) {
     try {
         $loaded = Get-Content -LiteralPath $Script:LocalConfigFile -Raw | ConvertFrom-Json
-        if ($loaded.aws_access_key_id) { $txtAk.Text = $loaded.aws_access_key_id }
-        if ($loaded.aws_secret_access_key) { $txtSk.Text = $loaded.aws_secret_access_key }
-        if ($loaded.region) { $cmbRegion.Text = $loaded.region }
-        if ($loaded.output_format) { $cmbFormat.Text = $loaded.output_format }
-        if ($loaded.session_token) { $txtTok.Text = $loaded.session_token }
-        if ($loaded.last_bucket) { $cmbBucket.Text = $loaded.last_bucket }
+        $props = $loaded.PSObject.Properties
+        if ($props["aws_access_key_id"] -and $loaded.aws_access_key_id) { $txtAk.Text = [string]$loaded.aws_access_key_id }
+        if ($props["aws_secret_access_key"] -and $loaded.aws_secret_access_key) { $txtSk.Text = [string]$loaded.aws_secret_access_key }
+        if ($props["region"] -and $loaded.region) { $cmbRegion.Text = [string]$loaded.region }
+        if ($props["output_format"] -and $loaded.output_format) { $cmbFormat.Text = [string]$loaded.output_format }
+        if ($props["session_token"] -and $loaded.session_token) { $txtTok.Text = [string]$loaded.session_token }
+        if ($props["last_bucket"] -and $loaded.last_bucket) { $cmbBucket.Text = [string]$loaded.last_bucket }
     } catch {}
 }
 
