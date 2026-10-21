@@ -119,6 +119,7 @@ class BackupOptions:
     verify_only_after: bool = False
     stats_interval: int = 5
     zip_after_backup: bool = True
+    zip_mode: str = "batch_folder"  # "batch_folder" (Whole Target Folder) or "per_db" (Individual DBs)
     zip_output_folder: str = ""
     delete_bak_after_zip: bool = False
 
@@ -128,6 +129,7 @@ class BackupJobResult:
     db_name: str
     success: bool
     stream_count: int
+    db_subfolder: str = ""
     file_paths: List[str] = field(default_factory=list)
     zip_path: str = ""
     elapsed_seconds: float = 0.0
@@ -221,7 +223,7 @@ def build_zip_file_path(
     custom_zip_folder: str = "",
 ) -> Tuple[str, str]:
     """
-    Build the destination Zip folder and full `.zip` archive path for a database's backup set.
+    Build the destination Zip folder and full `.zip` archive path for a single database's backup set.
     Returns `(zip_folder, zip_file_path)`.
     """
     if not timestamp:
@@ -230,6 +232,28 @@ def build_zip_file_path(
     zip_folder = resolve_zip_output_folder(target_folder, custom_zip_folder)
     zip_filename = f"{safe_db}_{timestamp}.zip"
     return zip_folder, join_windows_or_native_path(zip_folder, zip_filename)
+
+
+def build_batch_zip_file_path(
+    target_folder: str,
+    timestamp: Optional[str] = None,
+    custom_zip_folder: str = "",
+) -> Tuple[str, str, str]:
+    """
+    Build the destination Zip folder, full `.zip` archive path, and parent folder archive name
+    when zipping the whole target backup folder on completion of the export batch.
+    Returns `(zip_folder, batch_zip_file_path, parent_folder_name)`.
+    """
+    if not timestamp:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    cleaned_target = target_folder.strip().rstrip("\\/")
+    raw_parent = os.path.basename(cleaned_target.replace("\\", "/")) or "SqlBackups"
+    if raw_parent.endswith(":"):
+        raw_parent = "SqlBackups"
+    parent_folder_name = sanitize_filename(raw_parent)
+    zip_folder = resolve_zip_output_folder(target_folder, custom_zip_folder)
+    zip_filename = f"{parent_folder_name}_{timestamp}.zip"
+    return zip_folder, join_windows_or_native_path(zip_folder, zip_filename), parent_folder_name
 
 
 def find_7zip_executable() -> Optional[str]:
@@ -349,6 +373,117 @@ def fast_zip_backup_files(
                 pass
 
     return zip_path, (time.time() - t0)
+
+
+def fast_zip_target_folder_batch(
+    target_folder: str,
+    zip_path: str,
+    db_subfolders: Optional[List[str]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    status_callback: Optional[Callable[[str], None]] = None,
+    delete_source_after_zip: bool = False,
+) -> Tuple[str, float, int]:
+    """
+    Zips the whole target backup folder on completion of the export batch so all DB folders
+    sit inside a single zipped parent folder (`<ParentFolderName>/<DbName>/<file.bak>`).
+    Prioritizes speed of zip over compression ratio (`compresslevel=1` / `Z_BEST_SPEED` + 16 MB buffer).
+    Optionally deletes the unzipped DB backup folders once the batch `.zip` is verified complete.
+    Returns `(zip_path, elapsed_seconds, files_archived_count)`.
+    """
+    t0 = time.time()
+    _, _, parent_folder_name = build_batch_zip_file_path(target_folder)
+
+    zip_dir = os.path.dirname(os.path.abspath(zip_path))
+    if zip_dir:
+        os.makedirs(zip_dir, exist_ok=True)
+
+    # Identify all DB subfolders to include (excluding the Zip output folder itself)
+    folders_to_archive: List[str] = []
+    seen_norm: set[str] = set()
+    zip_dir_norm = os.path.normcase(os.path.abspath(zip_dir)) if zip_dir else ""
+
+    candidates: List[str] = []
+    if db_subfolders:
+        candidates.extend(db_subfolders)
+    if os.path.isdir(target_folder):
+        for entry in sorted(os.listdir(target_folder)):
+            full_entry = os.path.join(target_folder, entry)
+            if os.path.isdir(full_entry):
+                candidates.append(full_entry)
+
+    for folder in candidates:
+        if not folder or not os.path.isdir(folder):
+            continue
+        norm_f = os.path.normcase(os.path.abspath(folder))
+        if norm_f == zip_dir_norm or norm_f in seen_norm:
+            continue
+        seen_norm.add(norm_f)
+        folders_to_archive.append(folder)
+
+    # Collect all files across those DB subfolders
+    file_entries: List[Tuple[str, str]] = []  # (abs_file_path, arcname_in_zip)
+    for db_folder in folders_to_archive:
+        db_folder_name = os.path.basename(db_folder.rstrip("\\/"))
+        for root_dir, _dirs, files in os.walk(db_folder):
+            for fname in sorted(files):
+                full_path = os.path.join(root_dir, fname)
+                if os.path.normcase(os.path.abspath(full_path)) == os.path.normcase(os.path.abspath(zip_path)):
+                    continue
+                rel_inside_db = os.path.relpath(full_path, db_folder).replace("\\", "/")
+                arcname = f"{parent_folder_name}/{db_folder_name}/{rel_inside_db}"
+                file_entries.append((full_path, arcname))
+
+    if not file_entries:
+        raise FileNotFoundError(
+            f"No backup files found in target folder '{target_folder}' to archive."
+        )
+
+    if os.path.isfile(zip_path):
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+    total_files = len(file_entries)
+    with zipfile.ZipFile(
+        zip_path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=1,  # Z_BEST_SPEED: fastest possible zip speed over compression ratio
+        allowZip64=True,
+    ) as zf:
+        for idx, (src_path, arcname) in enumerate(file_entries, start=1):
+            if cancel_event and cancel_event.is_set():
+                raise RuntimeError("Batch Zip operation cancelled by user.")
+            if status_callback:
+                status_callback(
+                    f"Batch Fast-Zipping [{idx}/{total_files}] {os.path.basename(src_path)}..."
+                )
+            zinfo = zipfile.ZipInfo.from_file(src_path, arcname=arcname)
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
+            zinfo.compress_level = 1  # type: ignore[attr-defined]
+            with open(src_path, "rb") as src_fp, zf.open(zinfo, mode="w", force_zip64=True) as dst_fp:
+                while True:
+                    if cancel_event and cancel_event.is_set():
+                        raise RuntimeError("Batch Zip operation cancelled by user.")
+                    chunk = src_fp.read(FAST_ZIP_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    dst_fp.write(chunk)
+
+    if not os.path.isfile(zip_path) or os.path.getsize(zip_path) == 0:
+        raise RuntimeError(f"Batch Zip verification failed: {zip_path} is missing or empty.")
+
+    if delete_source_after_zip:
+        if status_callback:
+            status_callback("Deleting unzipped .bak backup folders after verified batch Zip...")
+        for db_folder in folders_to_archive:
+            try:
+                shutil.rmtree(db_folder, ignore_errors=True)
+            except OSError:
+                pass
+
+    return zip_path, (time.time() - t0), total_files
 
 
 def escape_tsql_identifier(identifier: str) -> str:
@@ -832,7 +967,11 @@ finally {
                     m = pct_regex.search(info_msg)
                     if m:
                         pct = int(m.group(1))
-                        scaled_pct = int(pct * 0.85) if options.zip_after_backup else pct
+                        scaled_pct = (
+                            int(pct * 0.85)
+                            if (options.zip_after_backup and options.zip_mode == "per_db")
+                            else pct
+                        )
                         if progress_callback:
                             progress_callback(
                                 db_info.name,
@@ -868,16 +1007,17 @@ finally {
                 db_name=db_info.name,
                 success=False,
                 stream_count=stream_count,
+                db_subfolder=db_subfolder,
                 file_paths=file_paths,
                 elapsed_seconds=elapsed,
                 used_compression=used_compression,
                 error_message=err_detail,
             )
 
-        # Step 4: Fast Post-Backup Zip (Speed over Compression Ratio)
+        # Step 4: Per-DB Fast Post-Backup Zip (only when zip_mode == "per_db")
         final_zip_path = ""
         zip_elapsed = 0.0
-        if options.zip_after_backup:
+        if options.zip_after_backup and options.zip_mode == "per_db":
             try:
                 if progress_callback:
                     progress_callback(db_info.name, 90, "Fast-Zipping .bak file(s)...")
@@ -897,6 +1037,7 @@ finally {
                     db_name=db_info.name,
                     success=False,
                     stream_count=stream_count,
+                    db_subfolder=db_subfolder,
                     file_paths=file_paths,
                     elapsed_seconds=elapsed,
                     used_compression=used_compression,
@@ -906,7 +1047,7 @@ finally {
         elapsed = time.time() - start_time
         done_msg = (
             f"Completed in {elapsed:.1f}s ({stream_count} {'stream' if stream_count == 1 else 'streams'}"
-            + (f", zipped in {zip_elapsed:.1f}s)" if options.zip_after_backup else ")")
+            + (f", zipped in {zip_elapsed:.1f}s)" if final_zip_path else ")")
         )
         if progress_callback:
             progress_callback(db_info.name, 100, done_msg)
@@ -915,6 +1056,7 @@ finally {
             db_name=db_info.name,
             success=True,
             stream_count=stream_count,
+            db_subfolder=db_subfolder,
             file_paths=file_paths,
             zip_path=final_zip_path,
             elapsed_seconds=elapsed,
@@ -950,6 +1092,7 @@ class SqlBackupApp:
         default_zip = r"C:\SqlBackups\Zipped"
         self.var_target_folder = tk.StringVar(value=default_target)
         self.var_zip_after_backup = tk.BooleanVar(value=True)
+        self.var_zip_mode = tk.StringVar(value="batch_folder")
         self.var_zip_folder = tk.StringVar(value=default_zip)
         self.var_delete_bak_after_zip = tk.BooleanVar(value=False)
         self._user_edited_zip_folder = False
@@ -1120,11 +1263,23 @@ class SqlBackupApp:
         srow_zip.pack(fill=tk.X, pady=3)
         ttk.Checkbutton(
             srow_zip,
-            text="Zip Backups into Folder (Fastest Speed Mode):",
+            text="Zip Backups (Fastest Speed):",
             variable=self.var_zip_after_backup,
             command=self._on_zip_toggle_change,
         ).pack(side=tk.LEFT, padx=(0, 6))
 
+        ttk.Label(srow_zip, text="Mode:").pack(side=tk.LEFT, padx=(0, 4))
+        self.cmb_zip_mode = ttk.Combobox(
+            srow_zip,
+            textvariable=self.var_zip_mode,
+            values=["batch_folder", "per_db"],
+            state="readonly",
+            width=14,
+        )
+        self.cmb_zip_mode.pack(side=tk.LEFT, padx=(0, 8))
+        self.cmb_zip_mode.bind("<<ComboboxSelected>>", lambda _e: self._on_settings_changed())
+
+        ttk.Label(srow_zip, text="Zip Folder:").pack(side=tk.LEFT, padx=(0, 4))
         self.ent_zip_folder = ttk.Entry(srow_zip, textvariable=self.var_zip_folder)
         self.ent_zip_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.ent_zip_folder.bind("<KeyRelease>", lambda _e: self._on_zip_folder_key())
@@ -1136,7 +1291,7 @@ class SqlBackupApp:
 
         self.chk_del_bak = ttk.Checkbutton(
             srow_zip,
-            text="Delete raw .bak files after Zip",
+            text="Delete unzipped backups once complete",
             variable=self.var_delete_bak_after_zip,
             command=self._on_settings_changed,
         )
@@ -1418,6 +1573,7 @@ class SqlBackupApp:
     def _on_zip_toggle_change(self) -> None:
         enabled = bool(self.var_zip_after_backup.get())
         state = "normal" if enabled else "disabled"
+        self.cmb_zip_mode.configure(state="readonly" if enabled else "disabled")
         self.ent_zip_folder.configure(state=state)
         self.btn_browse_zip.configure(state=state)
         self.chk_del_bak.configure(state=state)
@@ -1505,6 +1661,7 @@ class SqlBackupApp:
         thresh, max_streams, max_parallel = self._get_safe_threshold_and_streams()
         target_folder = self.var_target_folder.get().strip() or r"C:\SqlBackups"
         zip_folder = resolve_zip_output_folder(target_folder, self.var_zip_folder.get())
+        zip_mode = self.var_zip_mode.get().strip() or "batch_folder"
         return BackupOptions(
             target_folder=target_folder,
             split_threshold_gb=thresh,
@@ -1515,6 +1672,7 @@ class SqlBackupApp:
             checksum=bool(self.var_checksum.get()),
             verify_only_after=bool(self.var_verify_after.get()),
             zip_after_backup=bool(self.var_zip_after_backup.get()),
+            zip_mode=zip_mode,
             zip_output_folder=zip_folder,
             delete_bak_after_zip=bool(self.var_delete_bak_after_zip.get()),
         )
@@ -1533,6 +1691,7 @@ class SqlBackupApp:
             "include_system_dbs": bool(self.var_include_system.get()),
             "target_folder": self.var_target_folder.get().strip(),
             "zip_after_backup": bool(self.var_zip_after_backup.get()),
+            "zip_mode": self.var_zip_mode.get().strip(),
             "zip_output_folder": self.var_zip_folder.get().strip(),
             "delete_bak_after_zip": bool(self.var_delete_bak_after_zip.get()),
             "max_parallel_dbs": max_parallel,
@@ -1568,6 +1727,8 @@ class SqlBackupApp:
                 self.var_target_folder.set(data["target_folder"])
             if "zip_after_backup" in data:
                 self.var_zip_after_backup.set(bool(data["zip_after_backup"]))
+            if data.get("zip_mode") in ("batch_folder", "per_db"):
+                self.var_zip_mode.set(data["zip_mode"])
             if data.get("zip_output_folder"):
                 self._user_edited_zip_folder = True
                 self.var_zip_folder.set(data["zip_output_folder"])
@@ -1638,13 +1799,19 @@ class SqlBackupApp:
                 options.target_folder, db.name, streams, "YYYYMMDD"
             )
             if options.zip_after_backup:
-                _, zip_dest = build_zip_file_path(
-                    options.target_folder,
-                    db.name,
-                    "YYYYMMDD",
-                    options.zip_output_folder,
-                )
-                dest_display = f"{subfolder}  ➜  {zip_dest}"
+                if options.zip_mode == "batch_folder":
+                    _, batch_zip, parent_name = build_batch_zip_file_path(
+                        options.target_folder, "YYYYMMDD", options.zip_output_folder
+                    )
+                    dest_display = f"{subfolder}  ➜  {batch_zip} [{parent_name}/{db.name}]"
+                else:
+                    _, zip_dest = build_zip_file_path(
+                        options.target_folder,
+                        db.name,
+                        "YYYYMMDD",
+                        options.zip_output_folder,
+                    )
+                    dest_display = f"{subfolder}  ➜  {zip_dest}"
             else:
                 dest_display = subfolder
 
@@ -1755,11 +1922,24 @@ class SqlBackupApp:
             if d.name in self.selected_db_names and d not in preview_dbs:
                 preview_dbs.append(d)
 
-        zip_mode_note = (
-            f"-- Post-Backup Fast-Zip: ENABLED (Fastest Speed / Level 1 -> {options.zip_output_folder})\n"
-            if options.zip_after_backup
-            else "-- Post-Backup Fast-Zip: DISABLED\n"
-        )
+        if options.zip_after_backup:
+            if options.zip_mode == "batch_folder":
+                _, batch_zip_preview, parent_name = build_batch_zip_file_path(
+                    options.target_folder, timestamp_preview, options.zip_output_folder
+                )
+                del_suffix = (
+                    " (then delete unzipped DB folders)" if options.delete_bak_after_zip else ""
+                )
+                zip_mode_note = (
+                    f"-- Post-Backup Fast-Zip: WHOLE TARGET FOLDER -> {batch_zip_preview} "
+                    f"(Parent folder in zip: '{parent_name}/<DbName>/'){del_suffix}\n"
+                )
+            else:
+                zip_mode_note = (
+                    f"-- Post-Backup Fast-Zip: INDIVIDUAL DB ZIPS (Level 1 -> {options.zip_output_folder})\n"
+                )
+        else:
+            zip_mode_note = "-- Post-Backup Fast-Zip: DISABLED\n"
 
         if not preview_dbs:
             sample_small = DatabaseInfo(name="AppConfigDB", size_mb=2048.0)
@@ -1805,7 +1985,7 @@ class SqlBackupApp:
             )
             if options.verify_only_after:
                 block += build_verify_tsql(paths, checksum=options.checksum) + "\n"
-            if options.zip_after_backup:
+            if options.zip_after_backup and options.zip_mode == "per_db":
                 _, zip_dest = build_zip_file_path(
                     options.target_folder,
                     db.name,
@@ -1815,6 +1995,20 @@ class SqlBackupApp:
                 del_note = " (then delete raw .bak)" if options.delete_bak_after_zip else ""
                 block += f"-- Fast-Zip Output (Level 1 / Fastest): {zip_dest}{del_note}\n"
             blocks.append(block)
+
+        if options.zip_after_backup and options.zip_mode == "batch_folder":
+            _, batch_zip_preview, parent_name = build_batch_zip_file_path(
+                options.target_folder, timestamp_preview, options.zip_output_folder
+            )
+            del_note = (
+                "\n-- Post-Zip Cleanup: Delete unzipped DB backup folders once batch zip completes"
+                if options.delete_bak_after_zip
+                else ""
+            )
+            blocks.append(
+                f"-- [On Batch Completion] Fast-Zip Whole Target Folder (Level 1 / Fastest):\n"
+                f"-- Archive: {batch_zip_preview} (contains {parent_name}/<DbName>/*.bak){del_note}\n"
+            )
 
         if len(preview_dbs) > 6:
             blocks.append(f"-- ... plus {len(preview_dbs) - 6} more selected database(s) ...\n")
@@ -1919,7 +2113,52 @@ class SqlBackupApp:
                     with lock:
                         db_progress_pct[db.name] = 100
                         avg_pct = sum(db_progress_pct.values()) / max(1, len(selected_dbs))
+                        if options.zip_after_backup and options.zip_mode == "batch_folder":
+                            avg_pct = avg_pct * 0.85
                     self.ui_queue.put(("DB_FINISHED", (res, avg_pct)))
+
+            # Whole Target Folder Batch Zip on completion of the export batch
+            succeeded_results = [r for r in results if r.success]
+            if (
+                options.zip_after_backup
+                and options.zip_mode == "batch_folder"
+                and succeeded_results
+                and not self.cancel_event.is_set()
+            ):
+                _, batch_zip_path, parent_name = build_batch_zip_file_path(
+                    options.target_folder, batch_timestamp, options.zip_output_folder
+                )
+                self.ui_queue.put(
+                    (
+                        "BATCH_ZIP_STATUS",
+                        f"Zipping whole target backup folder into {batch_zip_path} (parent folder '{parent_name}/', Fastest speed mode)...",
+                    )
+                )
+                try:
+                    db_subfolders = [r.db_subfolder for r in succeeded_results if r.db_subfolder]
+                    out_zip, zip_secs, file_cnt = fast_zip_target_folder_batch(
+                        target_folder=options.target_folder,
+                        zip_path=batch_zip_path,
+                        db_subfolders=db_subfolders,
+                        cancel_event=self.cancel_event,
+                        status_callback=lambda msg: self.ui_queue.put(("BATCH_ZIP_PROGRESS", msg)),
+                        delete_source_after_zip=options.delete_bak_after_zip,
+                    )
+                    cleanup_note = (
+                        " (unzipped DB backup folders deleted)"
+                        if options.delete_bak_after_zip
+                        else ""
+                    )
+                    self.ui_queue.put(
+                        (
+                            "BATCH_ZIP_DONE",
+                            f"✓ Whole target folder zipped in {zip_secs:.1f}s ({file_cnt} file(s)) -> {out_zip}{cleanup_note}",
+                        )
+                    )
+                except Exception as batch_zip_exc:
+                    self.ui_queue.put(
+                        ("BATCH_ZIP_ERROR", f"✗ Batch Folder Fast-Zip FAILED: {batch_zip_exc}")
+                    )
 
             self.ui_queue.put(("BATCH_FINISHED", results))
 
@@ -2000,6 +2239,21 @@ class SqlBackupApp:
                         vals = list(self.tree.item(res.db_name, "values"))
                         vals[5] = status_str
                         self.tree.item(res.db_name, values=vals)
+
+                elif msg_type == "BATCH_ZIP_STATUS":
+                    self.var_overall_progress.set(90.0)
+                    self.var_progress_label.set("Fast-Zipping whole target folder...")
+                    self.log(str(payload))
+
+                elif msg_type == "BATCH_ZIP_PROGRESS":
+                    self.var_progress_label.set(str(payload))
+
+                elif msg_type == "BATCH_ZIP_DONE":
+                    self.var_overall_progress.set(100.0)
+                    self.log(str(payload))
+
+                elif msg_type == "BATCH_ZIP_ERROR":
+                    self.log(str(payload))
 
                 elif msg_type == "BATCH_FINISHED":
                     results: List[BackupJobResult] = payload  # type: ignore[assignment]

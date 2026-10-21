@@ -93,6 +93,60 @@ class TestSqlBackupGui(unittest.TestCase):
             for p in bak_paths:
                 self.assertFalse(os.path.exists(p))
 
+    def test_batch_folder_zip_and_delete_unzipped_backups(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_dir = os.path.join(tmpdir, "SqlBackups")
+            zip_dir, batch_zip_path, parent_name = sql_backup_gui.build_batch_zip_file_path(
+                target_folder=target_dir,
+                timestamp="20261021_223000",
+            )
+            self.assertEqual(parent_name, "SqlBackups")
+            self.assertTrue(batch_zip_path.endswith("SqlBackups_20261021_223000.zip"))
+
+            # Create two DB subfolders with mock .bak files
+            sub1, paths1 = sql_backup_gui.build_backup_file_paths(
+                target_folder=target_dir,
+                db_name="AlphaDB",
+                stream_count=1,
+                timestamp="20261021_223000",
+            )
+            sub2, paths2 = sql_backup_gui.build_backup_file_paths(
+                target_folder=target_dir,
+                db_name="BetaWarehouseDB",
+                stream_count=2,
+                timestamp="20261021_223000",
+            )
+            os.makedirs(sub1, exist_ok=True)
+            os.makedirs(sub2, exist_ok=True)
+            for p in paths1 + paths2:
+                Path(p).write_bytes(b"MOCK_BACKUP_DATA_" * 300)
+
+            out_zip, elapsed, count = sql_backup_gui.fast_zip_target_folder_batch(
+                target_folder=target_dir,
+                zip_path=batch_zip_path,
+                db_subfolders=[sub1, sub2],
+                delete_source_after_zip=True,
+            )
+            self.assertEqual(out_zip, batch_zip_path)
+            self.assertEqual(count, 3)
+            self.assertTrue(os.path.isfile(batch_zip_path))
+
+            # Verify all DB folders are inside the zipped parent folder "SqlBackups/"
+            with zipfile.ZipFile(batch_zip_path, "r") as zf:
+                names = sorted(zf.namelist())
+                self.assertEqual(
+                    names,
+                    [
+                        "SqlBackups/AlphaDB/AlphaDB_20261021_223000.bak",
+                        "SqlBackups/BetaWarehouseDB/BetaWarehouseDB_20261021_223000_stripe01of02.bak",
+                        "SqlBackups/BetaWarehouseDB/BetaWarehouseDB_20261021_223000_stripe02of02.bak",
+                    ],
+                )
+
+            # Verify unzipped DB backup folders were deleted after completion
+            self.assertFalse(os.path.exists(sub1))
+            self.assertFalse(os.path.exists(sub2))
+
     def test_create_subdir_tsql_wraps_error_183_in_try_catch(self):
         sql = sql_backup_gui.build_create_subdir_tsql(r"C:\Users\cdobbs4\SqlBackups\TSTSystemCatalog")
         self.assertIn("BEGIN TRY", sql)
@@ -166,7 +220,11 @@ class TestSqlBackupGui(unittest.TestCase):
             self.assertIn("stripe01of04.bak", preview_text)
             self.assertIn("stripe04of04.bak", preview_text)
             self.assertIn("COPY_ONLY", preview_text)
-            self.assertIn("Fast-Zip Output", preview_text)
+            self.assertIn("Fast-Zip Whole Target Folder", preview_text)
+
+            app.var_zip_mode.set("per_db")
+            app.update_tsql_preview()
+            self.assertIn("Fast-Zip Output", app.txt_tsql.get("1.0", tk.END))
         finally:
             root.destroy()
 

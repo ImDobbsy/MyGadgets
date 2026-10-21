@@ -121,6 +121,121 @@ function Get-ZipFilePath {
     }
 }
 
+function Get-BatchZipFilePath {
+    param(
+        [string]$TargetFolder,
+        [string]$Timestamp = "",
+        [string]$CustomZipFolder = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($Timestamp)) {
+        $Timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+    }
+    $cleanTarget = $TargetFolder.Trim().TrimEnd('\', '/')
+    $rawParent = [System.IO.Path]::GetFileName($cleanTarget)
+    if ([string]::IsNullOrWhiteSpace($rawParent) -or $rawParent.EndsWith(":")) {
+        $rawParent = "SqlBackups"
+    }
+    $parentName = Get-SafeFileName -Name $rawParent
+    $zipFolder = if (-not [string]::IsNullOrWhiteSpace($CustomZipFolder)) {
+        $CustomZipFolder.Trim().TrimEnd('\', '/')
+    }
+    else {
+        "$cleanTarget\Zipped"
+    }
+    return [PSCustomObject]@{
+        ZipFolder        = $zipFolder
+        ZipPath          = "$zipFolder\${parentName}_${Timestamp}.zip"
+        ParentFolderName = $parentName
+    }
+}
+
+function Invoke-FastZipBatchFolder {
+    param(
+        [string]$TargetFolder,
+        [string]$ZipPath,
+        [string[]]$DbSubfolders = @(),
+        [bool]$DeleteSourceAfterZip = $false
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $bInfo = Get-BatchZipFilePath -TargetFolder $TargetFolder
+    $parentName = $bInfo.ParentFolderName
+
+    $zipDir = Split-Path -Parent $ZipPath
+    if ($zipDir -and (-not (Test-Path -LiteralPath $zipDir))) {
+        New-Item -ItemType Directory -Force -Path $zipDir | Out-Null
+    }
+    $zipDirFull = if ($zipDir) { [System.IO.Path]::GetFullPath($zipDir).TrimEnd('\') } else { "" }
+
+    $foldersToArchive = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $DbSubfolders) {
+        foreach ($s in $DbSubfolders) {
+            if (-not [string]::IsNullOrWhiteSpace($s)) { $candidates.Add($s) }
+        }
+    }
+    if (Test-Path -LiteralPath $TargetFolder) {
+        foreach ($d in (Get-ChildItem -LiteralPath $TargetFolder -Directory -ErrorAction SilentlyContinue)) {
+            $candidates.Add($d.FullName)
+        }
+    }
+
+    foreach ($cand in $candidates) {
+        if (-not (Test-Path -LiteralPath $cand)) { continue }
+        $fullCand = [System.IO.Path]::GetFullPath($cand).TrimEnd('\')
+        if ($fullCand -ieq $zipDirFull) { continue }
+        if ($seen.Add($fullCand)) {
+            $foldersToArchive.Add($fullCand)
+        }
+    }
+
+    if (Test-Path -LiteralPath $ZipPath) {
+        Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $fileCount = 0
+    $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($dbFolder in $foldersToArchive) {
+            $dbFolderName = [System.IO.Path]::GetFileName($dbFolder)
+            $files = @(Get-ChildItem -LiteralPath $dbFolder -File -Recurse -ErrorAction SilentlyContinue)
+            foreach ($f in $files) {
+                if ($f.FullName -ieq $ZipPath) { continue }
+                $relPath = $f.FullName.Substring($dbFolder.Length).TrimStart('\', '/').Replace('\', '/')
+                $entryName = "$parentName/$dbFolderName/$relPath"
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $archive,
+                    $f.FullName,
+                    $entryName,
+                    [System.IO.Compression.CompressionLevel]::Fastest
+                )
+                $fileCount++
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    if ($fileCount -eq 0 -or (-not (Test-Path -LiteralPath $ZipPath))) {
+        throw "Batch Zip verification failed: no backup files were archived into $ZipPath"
+    }
+
+    if ($DeleteSourceAfterZip) {
+        foreach ($dbFolder in $foldersToArchive) {
+            Remove-Item -LiteralPath $dbFolder -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $sw.Stop()
+    return [PSCustomObject]@{
+        ZipPath        = $ZipPath
+        ElapsedSeconds = $sw.Elapsed.TotalSeconds
+        FileCount      = $fileCount
+    }
+}
+
 function Invoke-FastZipBackupFiles {
     param(
         [string[]]$FilePaths,
@@ -449,30 +564,44 @@ $grpSettings.Controls.Add($btnBrowseTarget)
 
 # Fast-Zip Row
 $chkZipAfter = New-Object System.Windows.Forms.CheckBox
-$chkZipAfter.Text = "Zip Backups into Folder (Fastest Speed):"
+$chkZipAfter.Text = "Zip Backups (Fastest):"
 $chkZipAfter.Checked = $true
 $chkZipAfter.Location = New-Object System.Drawing.Point(14, 54)
 $chkZipAfter.AutoSize = $true
 $grpSettings.Controls.Add($chkZipAfter)
 
+$lblZipMode = New-Object System.Windows.Forms.Label
+$lblZipMode.Text = "Mode:"
+$lblZipMode.Location = New-Object System.Drawing.Point(175, 55)
+$lblZipMode.AutoSize = $true
+$grpSettings.Controls.Add($lblZipMode)
+
+$cmbZipMode = New-Object System.Windows.Forms.ComboBox
+$cmbZipMode.DropDownStyle = "DropDownList"
+[void]$cmbZipMode.Items.AddRange(@("batch_folder", "per_db"))
+$cmbZipMode.SelectedIndex = 0
+$cmbZipMode.Location = New-Object System.Drawing.Point(218, 52)
+$cmbZipMode.Width = 105
+$grpSettings.Controls.Add($cmbZipMode)
+
 $txtZipFolder = New-Object System.Windows.Forms.TextBox
 $txtZipFolder.Text = (Join-Path $defaultTargetDir "Zipped")
-$txtZipFolder.Location = New-Object System.Drawing.Point(255, 52)
-$txtZipFolder.Width = 490
+$txtZipFolder.Location = New-Object System.Drawing.Point(332, 52)
+$txtZipFolder.Width = 385
 $txtZipFolder.Anchor = "Top, Left, Right"
 $grpSettings.Controls.Add($txtZipFolder)
 
 $btnBrowseZip = New-Object System.Windows.Forms.Button
 $btnBrowseZip.Text = "Browse Zip Folder..."
-$btnBrowseZip.Location = New-Object System.Drawing.Point(755, 50)
-$btnBrowseZip.Size = New-Object System.Drawing.Size(135, 26)
+$btnBrowseZip.Location = New-Object System.Drawing.Point(725, 50)
+$btnBrowseZip.Size = New-Object System.Drawing.Size(130, 26)
 $btnBrowseZip.Anchor = "Top, Right"
 $grpSettings.Controls.Add($btnBrowseZip)
 
 $chkDelBakAfterZip = New-Object System.Windows.Forms.CheckBox
-$chkDelBakAfterZip.Text = "Delete raw .bak after Zip"
+$chkDelBakAfterZip.Text = "Delete unzipped backups once complete"
 $chkDelBakAfterZip.Checked = $false
-$chkDelBakAfterZip.Location = New-Object System.Drawing.Point(905, 54)
+$chkDelBakAfterZip.Location = New-Object System.Drawing.Point(865, 54)
 $chkDelBakAfterZip.Anchor = "Top, Right"
 $chkDelBakAfterZip.AutoSize = $true
 $grpSettings.Controls.Add($chkDelBakAfterZip)
@@ -715,6 +844,8 @@ function Update-SummaryAndPreview {
     $targetFolder = $txtTarget.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($targetFolder)) { $targetFolder = "C:\SqlBackups" }
     $zipEnabled = $chkZipAfter.Checked
+    $zipMode = [string]$cmbZipMode.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($zipMode)) { $zipMode = "batch_folder" }
     $customZip = $txtZipFolder.Text.Trim()
 
     $checkedItems = New-Object System.Collections.ArrayList
@@ -729,8 +860,14 @@ function Update-SummaryAndPreview {
         $pathInfo = Get-BackupFilePaths -TargetFolder $targetFolder -DbName $dbObj.Name -StreamCount $streams -Timestamp "YYYYMMDD"
         $item.SubItems[2].Text = $streamLabel
         if ($zipEnabled) {
-            $zInfo = Get-ZipFilePath -TargetFolder $targetFolder -DbName $dbObj.Name -Timestamp "YYYYMMDD" -CustomZipFolder $customZip
-            $item.SubItems[5].Text = "$($pathInfo.Subfolder) -> $($zInfo.ZipPath)"
+            if ($zipMode -eq "batch_folder") {
+                $bInfo = Get-BatchZipFilePath -TargetFolder $targetFolder -Timestamp "YYYYMMDD" -CustomZipFolder $customZip
+                $item.SubItems[5].Text = "$($pathInfo.Subfolder) -> $($bInfo.ZipPath) [$($bInfo.ParentFolderName)/$($dbObj.Name)]"
+            }
+            else {
+                $zInfo = Get-ZipFilePath -TargetFolder $targetFolder -DbName $dbObj.Name -Timestamp "YYYYMMDD" -CustomZipFolder $customZip
+                $item.SubItems[5].Text = "$($pathInfo.Subfolder) -> $($zInfo.ZipPath)"
+            }
         }
         else {
             $item.SubItems[5].Text = $pathInfo.Subfolder
@@ -744,7 +881,7 @@ function Update-SummaryAndPreview {
         }
     }
 
-    $zipBadge = if ($zipEnabled) { " + Fast-Zip" } else { "" }
+    $zipBadge = if ($zipEnabled) { " + Fast-Zip ($zipMode)" } else { "" }
     $lblSummary.Text = ("Selected: {0} DBs ({1:N2} GB  |  {2} > {3:G} GB  |  {4} streams{5})" -f $checkedItems.Count, $totalGb, $largeCount, $thresh, $totalStreams, $zipBadge)
 
     # Build T-SQL preview
@@ -767,7 +904,13 @@ function Update-SummaryAndPreview {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("-- Parallel Workers: $maxParallel concurrent DBs | Split Threshold: > $thresh GB (up to $maxStreams streams)")
     if ($zipEnabled) {
-        [void]$sb.AppendLine("-- Post-Backup Fast-Zip: ENABLED (CompressionLevel::Fastest -> $customZip)")
+        if ($zipMode -eq "batch_folder") {
+            $bInfo = Get-BatchZipFilePath -TargetFolder $targetFolder -Timestamp $tsNow -CustomZipFolder $customZip
+            [void]$sb.AppendLine("-- Post-Backup Fast-Zip: WHOLE TARGET FOLDER -> $($bInfo.ZipPath) (contains $($bInfo.ParentFolderName)/<DbName>/*.bak)")
+        }
+        else {
+            [void]$sb.AppendLine("-- Post-Backup Fast-Zip: INDIVIDUAL DB ZIPS (CompressionLevel::Fastest -> $customZip)")
+        }
     }
     else {
         [void]$sb.AppendLine("-- Post-Backup Fast-Zip: DISABLED")
@@ -787,11 +930,16 @@ function Update-SummaryAndPreview {
         if ($chkVerify.Checked) {
             [void]$sb.AppendLine((Get-VerifyBackupTsql -FilePaths $pInfo.FilePaths -Checksum $chkChecksum.Checked))
         }
-        if ($zipEnabled) {
+        if ($zipEnabled -and $zipMode -eq "per_db") {
             $zInfo = Get-ZipFilePath -TargetFolder $targetFolder -DbName $db.Name -Timestamp $tsNow -CustomZipFolder $customZip
             [void]$sb.AppendLine("-- Fast-Zip Output (Fastest Mode): $($zInfo.ZipPath)")
         }
         [void]$sb.AppendLine("")
+    }
+    if ($zipEnabled -and $zipMode -eq "batch_folder") {
+        $bInfo = Get-BatchZipFilePath -TargetFolder $targetFolder -Timestamp $tsNow -CustomZipFolder $customZip
+        $delNote = if ($chkDelBakAfterZip.Checked) { " (then delete unzipped DB backup folders)" } else { "" }
+        [void]$sb.AppendLine("-- [On Batch Completion] Fast-Zip Whole Target Folder: $($bInfo.ZipPath)$delNote")
     }
     $txtPreview.Text = $sb.ToString()
 }
@@ -842,11 +990,14 @@ $chkShowPass.Add_CheckedChanged({
 
 $chkZipAfter.Add_CheckedChanged({
     $en = $chkZipAfter.Checked
+    $cmbZipMode.Enabled = $en
     $txtZipFolder.Enabled = $en
     $btnBrowseZip.Enabled = $en
     $chkDelBakAfterZip.Enabled = $en
     Update-SummaryAndPreview
 })
+
+$cmbZipMode.Add_SelectedIndexChanged({ Update-SummaryAndPreview })
 
 $btnBrowseTarget.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -925,6 +1076,7 @@ $btnSaveCfg.Add_Click({
         include_system_dbs = [bool]$chkIncludeSys.Checked
         target_folder = $txtTarget.Text.Trim()
         zip_after_backup = [bool]$chkZipAfter.Checked
+        zip_mode = [string]$cmbZipMode.SelectedItem
         zip_output_folder = $txtZipFolder.Text.Trim()
         delete_bak_after_zip = [bool]$chkDelBakAfterZip.Checked
         max_parallel_dbs = [int]$numParallelDbs.Value
@@ -1184,6 +1336,7 @@ $workerScriptBlock = {
             Elapsed = $sw.Elapsed.TotalSeconds
             ZipElapsed = $zipElapsed
             StreamCount = $StreamCount
+            Subfolder = $Subfolder
             OutputPath = $finalOutput
         })
     }
@@ -1195,6 +1348,7 @@ $workerScriptBlock = {
             Success = $false
             Elapsed = $sw.Elapsed.TotalSeconds
             StreamCount = $StreamCount
+            Subfolder = $Subfolder
             Error = ($_.Exception.GetBaseException().Message -replace "(\r|\n)+", " ")
         })
     }
@@ -1233,6 +1387,9 @@ $uiTimer.Add_Tick({
             $Script:FinishedBatchCount++
             $Script:ProgressMap[$dbName] = 100
             if ($evt.Success) {
+                if ($evt.Subfolder) {
+                    [void]$Script:SucceededSubfolders.Add([string]$evt.Subfolder)
+                }
                 $zipNote = if ($evt.ZipElapsed -gt 0) { (", zipped in {0:N1}s" -f $evt.ZipElapsed) } else { "" }
                 $stText = ("Done in {0:N1}s ({1} stream(s){2})" -f $evt.Elapsed, $evt.StreamCount, $zipNote)
                 if ($null -ne $lvItem) { $lvItem.SubItems[4].Text = $stText }
@@ -1256,14 +1413,28 @@ $uiTimer.Add_Tick({
     if ($Script:IsRunning -and $Script:FinishedBatchCount -ge $Script:TotalBatchCount -and $Script:TotalBatchCount -gt 0) {
         $Script:IsRunning = $false
         $uiTimer.Stop()
-        $btnStart.Enabled = $true
-        $btnConnect.Enabled = $true
-        $btnCancel.Enabled = $false
         if ($null -ne $Script:RunspacePool) {
             $Script:RunspacePool.Close()
             $Script:RunspacePool.Dispose()
             $Script:RunspacePool = $null
         }
+
+        if ($Script:BatchZipEnabled -and $Script:BatchZipMode -eq "batch_folder" -and $Script:SucceededSubfolders.Count -gt 0) {
+            try {
+                Write-UiLog "Zipping whole target backup folder into $($Script:BatchZipPath) (Fastest speed mode)..."
+                $form.Refresh()
+                $bRes = Invoke-FastZipBatchFolder -TargetFolder $Script:BatchTargetFolder -ZipPath $Script:BatchZipPath -DbSubfolders ([string[]]$Script:SucceededSubfolders.ToArray()) -DeleteSourceAfterZip $Script:BatchDeleteBak
+                $delMsg = if ($Script:BatchDeleteBak) { " (unzipped DB backup folders deleted)" } else { "" }
+                Write-UiLog ("SUCCESS Whole target folder zipped in {0:N1}s ({1} file(s)) -> {2}{3}" -f $bRes.ElapsedSeconds, $bRes.FileCount, $bRes.ZipPath, $delMsg)
+            }
+            catch {
+                Write-UiLog "FAILED Batch Folder Fast-Zip: $($_.Exception.Message)"
+            }
+        }
+
+        $btnStart.Enabled = $true
+        $btnConnect.Enabled = $true
+        $btnCancel.Enabled = $false
         Write-UiLog "================================================================"
         Write-UiLog "Parallel backup & Fast-Zip batch finished ($($Script:FinishedBatchCount) database(s) processed)."
     }
@@ -1288,9 +1459,19 @@ $btnStart.Add_Click({
     $thresh = [double]$numThresholdGb.Value
     $maxStreams = [int]$numMaxStreams.Value
     $zipEnabled = [bool]$chkZipAfter.Checked
+    $zipMode = [string]$cmbZipMode.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($zipMode)) { $zipMode = "batch_folder" }
     $customZip = $txtZipFolder.Text.Trim()
     $delBak = [bool]$chkDelBakAfterZip.Checked
     $batchTs = (Get-Date).ToString("yyyyMMdd_HHmmss")
+
+    $bZipInfo = Get-BatchZipFilePath -TargetFolder $targetFolder -Timestamp $batchTs -CustomZipFolder $customZip
+    $Script:BatchZipEnabled = $zipEnabled
+    $Script:BatchZipMode = $zipMode
+    $Script:BatchZipPath = $bZipInfo.ZipPath
+    $Script:BatchTargetFolder = $targetFolder
+    $Script:BatchDeleteBak = $delBak
+    $Script:SucceededSubfolders = New-Object System.Collections.Generic.List[string]
 
     $Script:IsRunning = $true
     $Script:TotalBatchCount = $selectedItems.Count
@@ -1303,12 +1484,13 @@ $btnStart.Add_Click({
     $btnConnect.Enabled = $false
     $btnCancel.Enabled = $true
 
-    Write-UiLog "Starting parallel COPY_ONLY backup batch for $($selectedItems.Count) database(s) (Max Parallel DBs: $maxParallel, Split Threshold: > $thresh GB, Fast-Zip: $zipEnabled)..."
+    Write-UiLog "Starting parallel COPY_ONLY backup batch for $($selectedItems.Count) database(s) (Max Parallel DBs: $maxParallel, Split Threshold: > $thresh GB, Fast-Zip: $zipEnabled [$zipMode])..."
 
     $Script:RunspacePool = [runspacefactory]::CreateRunspacePool(1, $maxParallel)
     $Script:RunspacePool.Open()
     $uiTimer.Start()
 
+    $perDbZip = ($zipEnabled -and $zipMode -eq "per_db")
     foreach ($item in $selectedItems) {
         $db = $item.Tag
         $item.SubItems[4].Text = "Queued"
@@ -1324,7 +1506,7 @@ $btnStart.Add_Click({
 
         $ps = [powershell]::Create()
         $ps.RunspacePool = $Script:RunspacePool
-        [void]$ps.AddScript($workerScriptBlock).AddArgument($connStr).AddArgument($db.Name).AddArgument($pInfo.Subfolder).AddArgument($pInfo.FilePaths).AddArgument($createDirSql).AddArgument($bakSql).AddArgument($bakFallbackSql).AddArgument($verSql).AddArgument([bool]$chkCompression.Checked).AddArgument($stCount).AddArgument($zipEnabled).AddArgument($zInfo.ZipPath).AddArgument($delBak).AddArgument($Script:UiEventQueue)
+        [void]$ps.AddScript($workerScriptBlock).AddArgument($connStr).AddArgument($db.Name).AddArgument($pInfo.Subfolder).AddArgument($pInfo.FilePaths).AddArgument($createDirSql).AddArgument($bakSql).AddArgument($bakFallbackSql).AddArgument($verSql).AddArgument([bool]$chkCompression.Checked).AddArgument($stCount).AddArgument($perDbZip).AddArgument($zInfo.ZipPath).AddArgument($delBak).AddArgument($Script:UiEventQueue)
         $handle = $ps.BeginInvoke()
         [void]$Script:ActiveJobs.Add(@{ PowerShell = $ps; Handle = $handle })
     }
@@ -1360,6 +1542,7 @@ if (Test-Path -LiteralPath $Script:ConfigFile) {
         if ($null -ne $saved.include_system_dbs) { $chkIncludeSys.Checked = [bool]$saved.include_system_dbs }
         if ($saved.target_folder) { $txtTarget.Text = $saved.target_folder }
         if ($null -ne $saved.zip_after_backup) { $chkZipAfter.Checked = [bool]$saved.zip_after_backup }
+        if ($saved.zip_mode) { $cmbZipMode.SelectedItem = $saved.zip_mode }
         if ($saved.zip_output_folder) {
             $Script:UserEditedZipFolder = $true
             $txtZipFolder.Text = $saved.zip_output_folder
