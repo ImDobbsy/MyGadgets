@@ -98,6 +98,27 @@ class TestAwsCpGui(unittest.TestCase):
         content = ps1_path.read_text(encoding="utf-8")
         self.assertIn('${url}?${canonicalQuery}', content)
         self.assertNotIn('"$url?$canonicalQuery"', content)
+        self.assertIn("Delete .zip Files...", content)
+
+    def test_filter_zip_entries_and_rm_command(self):
+        entries = [
+            aws_cp_gui.S3Entry(name="archive1.zip", key="backups/archive1.zip", is_dir=False, size=1024),
+            aws_cp_gui.S3Entry(name="UPPER.ZIP", key="backups/UPPER.ZIP", is_dir=False, size=2048),
+            aws_cp_gui.S3Entry(name="data.bak", key="backups/data.bak", is_dir=False, size=4096),
+            aws_cp_gui.S3Entry(name="subfolder.zip", key="backups/subfolder.zip/", is_dir=True),
+        ]
+        zips = aws_cp_gui.filter_zip_entries(entries)
+        self.assertEqual([e.key for e in zips], ["backups/archive1.zip", "backups/UPPER.ZIP"])
+
+        rm_args = aws_cp_gui.build_aws_rm_zip_command_args(
+            s3_uri="s3://my-bucket/backups/",
+            region="eu-west-2",
+            output_format="json",
+            recursive=True,
+            dryrun=True,
+        )
+        preview = aws_cp_gui.format_command_preview(rm_args)
+        self.assertIn("aws s3 rm s3://my-bucket/backups/ --recursive --exclude * --include *.zip --dryrun", preview)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ A self-contained local graphical user interface for transferring files and folde
    - **Copy FROM S3 Bucket (Download)**: Pick a source S3 object or folder (prefix) and a target local folder/file.
 3. **Dual Explorers**:
    - **Local File & Folder Explorer**: Interactive folder/file browser plus native OS `Browse Local File...` and `Browse Local Folder...` dialogs.
-   - **S3 Bucket & Folder Explorer**: Connect and list buckets, or type a bucket name directly (if your IAM policy restricts `s3:ListAllMyBuckets`), browse prefixes, and create S3 folders.
+   - **S3 Bucket & Folder Explorer**: Connect and list buckets, or type a bucket name directly (if your IAM policy restricts `s3:ListAllMyBuckets`), browse prefixes, create S3 folders, and use **`Delete .zip Files...`** to scan the current S3 folder (or subfolders recursively), preview matching `.zip` objects + total size, and delete them safely.
 4. **Live `aws s3 cp` Command Preview & Dual Execution Engines**:
    - Displays the exact `aws s3 cp` command with `--recursive`, `--dryrun`, `--storage-class`, `--region`, and `--output`.
    - Executes via `aws s3 cp` CLI (when installed) or the built-in zero-dependency S3 HTTPS engine.

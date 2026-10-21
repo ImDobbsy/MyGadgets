@@ -649,6 +649,11 @@ class StdlibS3Client:
                     if progress_cb:
                         progress_cb(downloaded, total)
 
+    def delete_object(self, bucket: str, key: str) -> None:
+        """Delete a single object `s3://bucket/key`."""
+        with self._execute("DELETE", bucket=bucket, key=key, timeout=60):
+            pass
+
 
 # ============================================================================
 # Unified S3 Service (Boto3 if available, otherwise Pure-Stdlib SigV4)
@@ -749,6 +754,43 @@ class S3Service:
             progress_cb=progress_cb,
             cancel_event=cancel_event,
         )
+
+    def delete_object(self, bucket: str, key: str) -> None:
+        self.stdlib_client.delete_object(bucket=bucket, key=key)
+
+
+def filter_zip_entries(entries: List[S3Entry]) -> List[S3Entry]:
+    """Return only non-directory S3 entries whose key ends with `.zip` (case-insensitive)."""
+    return [e for e in entries if (not e.is_dir) and e.key.lower().endswith(".zip")]
+
+
+def build_aws_rm_zip_command_args(
+    s3_uri: str,
+    region: str,
+    output_format: str,
+    recursive: bool = False,
+    dryrun: bool = False,
+    aws_executable: str = "aws",
+) -> List[str]:
+    """Build the argument list for `aws s3 rm` targeting only `.zip` files."""
+    args = [
+        aws_executable,
+        "s3",
+        "rm",
+        s3_uri.strip(),
+        "--recursive",
+        "--exclude",
+        "*",
+        "--include",
+        "*.zip" if recursive else "*.zip",
+    ]
+    if dryrun:
+        args.append("--dryrun")
+    if region.strip():
+        args.extend(["--region", region.strip()])
+    if output_format.strip():
+        args.extend(["--output", output_format.strip()])
+    return args
 
 
 # ============================================================================
@@ -1144,6 +1186,11 @@ class AwsCpTransferApp:
             s3_action_bar,
             text="Use Current S3 Folder",
             command=self.use_current_s3_folder,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            s3_action_bar,
+            text="Delete .zip Files...",
+            command=self.delete_s3_zip_files_dialog,
         ).pack(side=tk.LEFT, padx=(0, 6))
         self.btn_use_s3 = ttk.Button(
             s3_action_bar,
@@ -1869,6 +1916,265 @@ class AwsCpTransferApp:
         ttk.Button(btn_row, text="Create", command=_create).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT)
         ent.bind("<Return>", lambda _e: _create())
+
+    def delete_s3_zip_files_dialog(self) -> None:
+        """Open a modal dialog that scans for `.zip` files in the current S3 bucket/prefix and deletes them."""
+        bucket = self.var_s3_bucket.get().strip()
+        if bucket.startswith("s3://"):
+            try:
+                bucket, extracted_prefix = parse_s3_uri(bucket)
+                self.var_s3_bucket.set(bucket)
+                if extracted_prefix and not self.var_s3_prefix.get().strip():
+                    self.var_s3_prefix.set(extracted_prefix)
+            except ValueError as exc:
+                messagebox.showwarning("Invalid S3 URI", str(exc))
+                return
+
+        if not bucket:
+            messagebox.showwarning("Bucket Required", "Please select or enter an S3 bucket name first.")
+            return
+
+        try:
+            creds = self.get_credentials_config()
+            creds.validate()
+        except ValueError as exc:
+            messagebox.showwarning("AWS Credentials Required", str(exc))
+            return
+
+        prefix = self.var_s3_prefix.get().strip().lstrip("/")
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        target_uri = build_s3_uri(bucket, prefix)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Delete .zip Files in {target_uri}")
+        dlg.geometry("760x500")
+        dlg.minsize(640, 400)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding="12")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"Target S3 Location: {target_uri}",
+            style="SubHeader.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        opt_row = ttk.Frame(frame)
+        opt_row.pack(fill=tk.X, pady=(0, 6))
+
+        var_inc_subfolders = tk.BooleanVar(value=False)
+        var_zip_dryrun = tk.BooleanVar(value=self.var_dryrun.get())
+        var_summary = tk.StringVar(value="Scanning for .zip files...")
+        var_rm_cmd = tk.StringVar()
+
+        matching_entries: List[S3Entry] = []
+
+        def _update_rm_preview() -> None:
+            args = build_aws_rm_zip_command_args(
+                s3_uri=target_uri,
+                region=creds.region,
+                output_format=creds.output_format,
+                recursive=var_inc_subfolders.get(),
+                dryrun=var_zip_dryrun.get(),
+            )
+            var_rm_cmd.set(format_command_preview(args))
+
+        chk_sub = ttk.Checkbutton(
+            opt_row,
+            text="Include subfolders recursively",
+            variable=var_inc_subfolders,
+            command=lambda: (_update_rm_preview(), _scan_zips()),
+        )
+        chk_sub.pack(side=tk.LEFT, padx=(0, 16))
+
+        chk_dry = ttk.Checkbutton(
+            opt_row,
+            text="Dry Run (--dryrun)",
+            variable=var_zip_dryrun,
+            command=_update_rm_preview,
+        )
+        chk_dry.pack(side=tk.LEFT, padx=(0, 16))
+
+        btn_rescan = ttk.Button(opt_row, text="Rescan", command=lambda: _scan_zips())
+        btn_rescan.pack(side=tk.RIGHT)
+
+        # CLI Preview inside dialog
+        cmd_row = ttk.Frame(frame)
+        cmd_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(cmd_row, text="Equivalent CLI:").pack(side=tk.LEFT, padx=(0, 6))
+        ent_rm = ttk.Entry(cmd_row, textvariable=var_rm_cmd, state="readonly")
+        ent_rm.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Matching .zip files table
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        zip_tree = ttk.Treeview(
+            tree_frame,
+            columns=("size", "modified"),
+            selectmode="extended",
+        )
+        zip_tree.heading("#0", text=".zip Object Key", anchor=tk.W)
+        zip_tree.heading("size", text="Size", anchor=tk.E)
+        zip_tree.heading("modified", text="Last Modified", anchor=tk.W)
+        zip_tree.column("#0", width=460, anchor=tk.W)
+        zip_tree.column("size", width=100, anchor=tk.E)
+        zip_tree.column("modified", width=140, anchor=tk.W)
+
+        zip_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=zip_tree.yview)
+        zip_tree.configure(yscrollcommand=zip_scroll.set)
+        zip_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        zip_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bottom summary & action bar
+        bottom_bar = ttk.Frame(frame)
+        bottom_bar.pack(fill=tk.X)
+
+        ttk.Label(bottom_bar, textvariable=var_summary, style="SubHeader.TLabel").pack(side=tk.LEFT)
+
+        btn_close = ttk.Button(bottom_bar, text="Close", command=dlg.destroy)
+        btn_close.pack(side=tk.RIGHT, padx=(6, 0))
+
+        btn_delete = ttk.Button(
+            bottom_bar,
+            text="Delete Matching .zip Files",
+            style="Accent.TButton",
+            state=tk.DISABLED,
+        )
+        btn_delete.pack(side=tk.RIGHT)
+
+        def _scan_zips() -> None:
+            btn_delete.configure(state=tk.DISABLED)
+            btn_rescan.configure(state=tk.DISABLED)
+            var_summary.set("Scanning S3 for .zip files...")
+            for item in zip_tree.get_children():
+                zip_tree.delete(item)
+
+            delim = "" if var_inc_subfolders.get() else "/"
+
+            def _worker():
+                try:
+                    svc = S3Service(creds)
+                    entries = svc.list_objects(bucket=bucket, prefix=prefix, delimiter=delim)
+                    zips = filter_zip_entries(entries)
+
+                    def _populate():
+                        if not dlg.winfo_exists():
+                            return
+                        matching_entries.clear()
+                        matching_entries.extend(zips)
+                        total_bytes = sum(e.size or 0 for e in zips)
+                        for e in zips:
+                            zip_tree.insert(
+                                "",
+                                tk.END,
+                                iid=e.key,
+                                text=e.key,
+                                values=(format_size(e.size), e.last_modified),
+                            )
+                        scope_str = "including subfolders" if delim == "" else "in current folder"
+                        var_summary.set(
+                            f"Found {len(zips)} .zip file(s) {scope_str} (Total: {format_size(total_bytes)})"
+                        )
+                        btn_rescan.configure(state=tk.NORMAL)
+                        if zips:
+                            btn_delete.configure(state=tk.NORMAL)
+
+                    self.post_ui(_populate)
+                except Exception as exc:
+                    self.log(f"Error scanning for .zip files in {target_uri}: {exc}")
+                    self.post_ui(
+                        lambda: (
+                            var_summary.set(f"Scan failed: {exc}"),
+                            btn_rescan.configure(state=tk.NORMAL),
+                        )
+                    )
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _execute_delete() -> None:
+            if not matching_entries:
+                return
+            count = len(matching_entries)
+            total_bytes = sum(e.size or 0 for e in matching_entries)
+            is_dry = var_zip_dryrun.get()
+
+            if not is_dry:
+                confirm = messagebox.askyesno(
+                    "Confirm Delete .zip Files",
+                    f"Are you sure you want to permanently delete {count} .zip file(s) "
+                    f"({format_size(total_bytes)}) from {target_uri}?",
+                    parent=dlg,
+                )
+                if not confirm:
+                    return
+
+            btn_delete.configure(state=tk.DISABLED)
+            btn_rescan.configure(state=tk.DISABLED)
+            chk_sub.configure(state=tk.DISABLED)
+            chk_dry.configure(state=tk.DISABLED)
+
+            to_delete = list(matching_entries)
+
+            def _del_worker():
+                svc = S3Service(creds)
+                deleted_count = 0
+                try:
+                    self.log(
+                        f"Starting {'DRY RUN ' if is_dry else ''}deletion of {len(to_delete)} .zip file(s) in {target_uri}"
+                    )
+                    for idx, entry in enumerate(to_delete, start=1):
+                        obj_uri = build_s3_uri(bucket, entry.key)
+                        if is_dry:
+                            self.log(f"(dryrun) delete: {obj_uri}")
+                        else:
+                            self.log(f"[{idx}/{len(to_delete)}] delete: {obj_uri}")
+                            svc.delete_object(bucket=bucket, key=entry.key)
+                        deleted_count += 1
+                        pct = (idx / len(to_delete)) * 100.0
+                        msg = f"{'Simulated' if is_dry else 'Deleted'} [{idx}/{len(to_delete)}]: {entry.name}"
+                        self.post_ui(
+                            lambda p=pct, m=msg: (
+                                self.var_progress.set(p),
+                                self.var_status.set(m),
+                                var_summary.set(m) if dlg.winfo_exists() else None,
+                            )
+                        )
+
+                    done_msg = (
+                        f"Dry run complete: {deleted_count} .zip file(s) would be deleted."
+                        if is_dry
+                        else f"Successfully deleted {deleted_count} .zip file(s) from {target_uri}."
+                    )
+                    self.log(done_msg)
+
+                    def _on_complete():
+                        self.var_status.set(done_msg)
+                        self.refresh_s3_objects()
+                        if dlg.winfo_exists():
+                            messagebox.showinfo("Delete .zip Files", done_msg, parent=dlg)
+                            dlg.destroy()
+
+                    self.post_ui(_on_complete)
+                except Exception as exc:
+                    self.log(f"Error deleting .zip files: {exc}")
+                    self.post_ui(
+                        lambda: (
+                            messagebox.showerror("Delete Error", str(exc), parent=dlg if dlg.winfo_exists() else self.root),
+                            btn_rescan.configure(state=tk.NORMAL) if dlg.winfo_exists() else None,
+                            chk_sub.configure(state=tk.NORMAL) if dlg.winfo_exists() else None,
+                            chk_dry.configure(state=tk.NORMAL) if dlg.winfo_exists() else None,
+                        )
+                    )
+
+            threading.Thread(target=_del_worker, daemon=True).start()
+
+        btn_delete.configure(command=_execute_delete)
+        _update_rm_preview()
+        _scan_zips()
 
     # ========================================================================
     # Transfer Execution (AWS CLI & Built-in S3 Engine)

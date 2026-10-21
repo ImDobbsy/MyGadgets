@@ -580,6 +580,12 @@ $btnUseCurrentS3.Location = New-Object System.Drawing.Point(10, 52)
 $btnUseCurrentS3.Size = New-Object System.Drawing.Size(170, 25)
 $grpS3.Controls.Add($btnUseCurrentS3)
 
+$btnDeleteZips = New-Object System.Windows.Forms.Button
+$btnDeleteZips.Text = "Delete .zip Files..."
+$btnDeleteZips.Location = New-Object System.Drawing.Point(188, 52)
+$btnDeleteZips.Size = New-Object System.Drawing.Size(150, 25)
+$grpS3.Controls.Add($btnDeleteZips)
+
 $lvS3 = New-Object System.Windows.Forms.ListView
 $lvS3.Location = New-Object System.Drawing.Point(10, 84)
 $lvS3.Size = New-Object System.Drawing.Size(550, 225)
@@ -908,6 +914,234 @@ $btnUseCurrentS3.Add_Click({
         $chkRecursive.Checked = $true
     }
     Update-Preview
+})
+
+$btnDeleteZips.Add_Click({
+    $bucket = $cmbBucket.Text.Trim()
+    if ($bucket.StartsWith("s3://")) {
+        try {
+            $parsedUri = Split-S3Uri $bucket
+            $bucket = $parsedUri.Bucket
+            $cmbBucket.Text = $bucket
+            if ($parsedUri.Key -and [string]::IsNullOrWhiteSpace($txtPrefix.Text)) {
+                $txtPrefix.Text = $parsedUri.Key
+            }
+        } catch {}
+    }
+    if (-not $bucket) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter or select an S3 bucket name first.", "Bucket Required") | Out-Null
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($txtAk.Text) -or [string]::IsNullOrWhiteSpace($txtSk.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("AWS Access Key ID and Secret Access Key are required.", "Credentials Required") | Out-Null
+        return
+    }
+
+    $prefix = $txtPrefix.Text.Trim().TrimStart('/')
+    if ($prefix -and (-not $prefix.EndsWith("/"))) { $prefix = "$prefix/" }
+    $targetUri = if ($prefix) { "s3://$bucket/$prefix" } else { "s3://$bucket/" }
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "Delete .zip Files in $targetUri"
+    $dlg.Size = New-Object System.Drawing.Size(760, 500)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.Font = $form.Font
+
+    $lblLoc = New-Object System.Windows.Forms.Label
+    $lblLoc.Text = "Target S3 Location: $targetUri"
+    $lblLoc.Location = New-Object System.Drawing.Point(12, 12)
+    $lblLoc.AutoSize = $true
+    $lblLoc.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lblLoc)
+
+    $chkIncSub = New-Object System.Windows.Forms.CheckBox
+    $chkIncSub.Text = "Include subfolders recursively"
+    $chkIncSub.Location = New-Object System.Drawing.Point(12, 38)
+    $chkIncSub.AutoSize = $true
+    $chkIncSub.Checked = $false
+    $dlg.Controls.Add($chkIncSub)
+
+    $chkZipDry = New-Object System.Windows.Forms.CheckBox
+    $chkZipDry.Text = "Dry Run (--dryrun)"
+    $chkZipDry.Location = New-Object System.Drawing.Point(240, 38)
+    $chkZipDry.AutoSize = $true
+    $chkZipDry.Checked = $chkDryRun.Checked
+    $dlg.Controls.Add($chkZipDry)
+
+    $btnRescan = New-Object System.Windows.Forms.Button
+    $btnRescan.Text = "Rescan"
+    $btnRescan.Location = New-Object System.Drawing.Point(650, 34)
+    $btnRescan.Size = New-Object System.Drawing.Size(80, 25)
+    $btnRescan.Anchor = "Top, Right"
+    $dlg.Controls.Add($btnRescan)
+
+    $lblRmCli = New-Object System.Windows.Forms.Label
+    $lblRmCli.Text = "Equivalent CLI:"
+    $lblRmCli.Location = New-Object System.Drawing.Point(12, 68)
+    $lblRmCli.AutoSize = $true
+    $dlg.Controls.Add($lblRmCli)
+
+    $txtRmCli = New-Object System.Windows.Forms.TextBox
+    $txtRmCli.Location = New-Object System.Drawing.Point(110, 65)
+    $txtRmCli.Size = New-Object System.Drawing.Size(620, 23)
+    $txtRmCli.ReadOnly = $true
+    $txtRmCli.Anchor = "Top, Left, Right"
+    $dlg.Controls.Add($txtRmCli)
+
+    $lvZips = New-Object System.Windows.Forms.ListView
+    $lvZips.Location = New-Object System.Drawing.Point(12, 96)
+    $lvZips.Size = New-Object System.Drawing.Size(718, 310)
+    $lvZips.Anchor = "Top, Bottom, Left, Right"
+    $lvZips.View = "Details"
+    $lvZips.FullRowSelect = $true
+    [void]$lvZips.Columns.Add(".zip Object Key", 460)
+    [void]$lvZips.Columns.Add("Size", 100)
+    [void]$lvZips.Columns.Add("Last Modified", 140)
+    $dlg.Controls.Add($lvZips)
+
+    $lblSummary = New-Object System.Windows.Forms.Label
+    $lblSummary.Text = "Scanning..."
+    $lblSummary.Location = New-Object System.Drawing.Point(12, 420)
+    $lblSummary.AutoSize = $true
+    $lblSummary.Anchor = "Bottom, Left"
+    $lblSummary.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lblSummary)
+
+    $btnDelExec = New-Object System.Windows.Forms.Button
+    $btnDelExec.Text = "Delete Matching .zip Files"
+    $btnDelExec.Location = New-Object System.Drawing.Point(445, 415)
+    $btnDelExec.Size = New-Object System.Drawing.Size(195, 28)
+    $btnDelExec.Anchor = "Bottom, Right"
+    $btnDelExec.Enabled = $false
+    $btnDelExec.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($btnDelExec)
+
+    $btnCloseDlg = New-Object System.Windows.Forms.Button
+    $btnCloseDlg.Text = "Close"
+    $btnCloseDlg.Location = New-Object System.Drawing.Point(648, 415)
+    $btnCloseDlg.Size = New-Object System.Drawing.Size(82, 28)
+    $btnCloseDlg.Anchor = "Bottom, Right"
+    $btnCloseDlg.Add_Click({ $dlg.Close() })
+    $dlg.Controls.Add($btnCloseDlg)
+
+    $updateRmPreview = {
+        $dryFlag = if ($chkZipDry.Checked) { " --dryrun" } else { "" }
+        $txtRmCli.Text = ('aws s3 rm "{0}" --recursive --exclude "*" --include "*.zip"{1} --region {2} --output {3}' -f $targetUri, $dryFlag, $cmbRegion.Text.Trim(), $cmbFormat.Text.Trim())
+    }
+
+    $scanZips = {
+        & $updateRmPreview
+        $lvZips.Items.Clear()
+        $btnDelExec.Enabled = $false
+        $lblSummary.Text = "Scanning $targetUri for .zip files..."
+        [System.Windows.Forms.Application]::DoEvents()
+
+        try {
+            $q = @{ "list-type" = "2"; "max-keys" = "1000" }
+            if ($prefix) { $q["prefix"] = $prefix }
+            if (-not $chkIncSub.Checked) { $q["delimiter"] = "/" }
+
+            $xmlText = Invoke-S3SignedRequest `
+                -Method "GET" `
+                -AccessKey $txtAk.Text `
+                -SecretKey $txtSk.Text `
+                -SessionToken $txtTok.Text `
+                -Region $cmbRegion.Text `
+                -Bucket $bucket `
+                -QueryParams $q
+            [xml]$doc = $xmlText
+
+            $totalBytes = 0L
+            foreach ($c in $doc.SelectNodes("//*[local-name()='Contents']")) {
+                $kNode = $c.SelectSingleNode("*[local-name()='Key']")
+                if ($null -eq $kNode) { continue }
+                $kVal = [string]$kNode.InnerText
+                if (-not $kVal -or $kVal -eq $prefix) { continue }
+                if (-not $kVal.ToLowerInvariant().EndsWith(".zip")) { continue }
+
+                $sizeNode = $c.SelectSingleNode("*[local-name()='Size']")
+                $sizeBytes = if ($null -ne $sizeNode -and $sizeNode.InnerText) { [long]$sizeNode.InnerText } else { 0L }
+                $totalBytes += $sizeBytes
+                $modNode = $c.SelectSingleNode("*[local-name()='LastModified']")
+                $modRaw = if ($null -ne $modNode -and $modNode.InnerText) { [string]$modNode.InnerText } else { "" }
+                $modStr = if ($modRaw) { $modRaw.Substring(0, [Math]::Min(19, $modRaw.Length)).Replace("T", " ") } else { "" }
+
+                $lvi = New-Object System.Windows.Forms.ListViewItem($kVal)
+                $lvi.Tag = $kVal
+                [void]$lvi.SubItems.Add((Format-ByteSize $sizeBytes))
+                [void]$lvi.SubItems.Add($modStr)
+                [void]$lvZips.Items.Add($lvi)
+            }
+
+            $scopeStr = if ($chkIncSub.Checked) { "including subfolders" } else { "in current folder" }
+            $lblSummary.Text = "Found $($lvZips.Items.Count) .zip file(s) $scopeStr (Total: $(Format-ByteSize $totalBytes))"
+            $btnDelExec.Enabled = ($lvZips.Items.Count -gt 0)
+        } catch {
+            $lblSummary.Text = "Scan failed: $($_.Exception.Message)"
+            Write-UiLog "Error scanning for .zip files: $($_.Exception.Message)"
+        }
+    }
+
+    $chkIncSub.Add_CheckedChanged($scanZips)
+    $chkZipDry.Add_CheckedChanged($updateRmPreview)
+    $btnRescan.Add_Click($scanZips)
+
+    $btnDelExec.Add_Click({
+        if ($lvZips.Items.Count -eq 0) { return }
+        $count = $lvZips.Items.Count
+        $isDry = $chkZipDry.Checked
+        if (-not $isDry) {
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                "Are you sure you want to permanently delete $count .zip file(s) from ${targetUri}?",
+                "Confirm Delete .zip Files",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        }
+
+        $btnDelExec.Enabled = $false
+        $deletedCount = 0
+        try {
+            Write-UiLog "Starting $(if ($isDry) { 'DRY RUN ' } else { '' })deletion of $count .zip file(s) in $targetUri"
+            foreach ($item in $lvZips.Items) {
+                $keyToDel = [string]$item.Tag
+                $objUri = "s3://$bucket/$keyToDel"
+                if ($isDry) {
+                    Write-UiLog "(dryrun) delete: $objUri"
+                } else {
+                    Write-UiLog "delete: $objUri"
+                    [void](Invoke-S3SignedRequest `
+                        -Method "DELETE" `
+                        -AccessKey $txtAk.Text `
+                        -SecretKey $txtSk.Text `
+                        -SessionToken $txtTok.Text `
+                        -Region $cmbRegion.Text `
+                        -Bucket $bucket `
+                        -Key $keyToDel)
+                }
+                $deletedCount++
+                $lblSummary.Text = "Processed $deletedCount / $count .zip file(s)..."
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            $doneMsg = if ($isDry) {
+                "Dry run complete: $deletedCount .zip file(s) would be deleted."
+            } else {
+                "Successfully deleted $deletedCount .zip file(s) from $targetUri."
+            }
+            Write-UiLog $doneMsg
+            Refresh-S3Objects
+            [System.Windows.Forms.MessageBox]::Show($doneMsg, "Delete .zip Files") | Out-Null
+            $dlg.Close()
+        } catch {
+            Write-UiLog "Error deleting .zip files: $($_.Exception.Message)"
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Delete Error") | Out-Null
+            $btnDelExec.Enabled = $true
+        }
+    })
+
+    $dlg.Add_Shown($scanZips)
+    [void]$dlg.ShowDialog($form)
 })
 
 $lvS3.Add_SelectedIndexChanged({
